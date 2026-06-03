@@ -1,34 +1,83 @@
-import { defineEntity, MikroORM, p, ref } from '@mikro-orm/core';
+import { defineEntity, EntityClass, MikroORM, p, ref } from '@mikro-orm/core';
 import { SqliteDriver } from '@mikro-orm/sqlite';
 
 // Issue: https://github.com/mikro-orm/mikro-orm/issues/7843
-// defineEntity API: dirty tracking doesn't detect changes to manyToOne Ref fields
+// Full entity hierarchy copied from the actual project
 
-const CategorySchema = defineEntity({
-  name: 'Category',
-  tableName: 'categories',
+// --- BaseEntity ---
+const BaseEntitySchema = defineEntity({
+  name: 'BaseEntity',
+  abstract: true,
   properties: {
     id: p.integer().primary().autoincrement(),
-    name: p.string(),
   },
 });
+class BaseEntity extends BaseEntitySchema.class {}
+BaseEntitySchema.setClass(BaseEntity);
 
-class Category extends CategorySchema.class {}
-CategorySchema.setClass(Category);
+// --- ExtendBaseEntity (with self-referencing createUserId/updateUserId via string ref) ---
+// String reference to break circular ESM dependency (same pattern as in the project)
+const userEntityRef = 'UserEntity' as unknown as EntityClass<UserEntity>;
 
-const ItemSchema = defineEntity({
-  name: 'Item',
-  tableName: 'items',
+const ExtendBaseEntitySchema = defineEntity({
+  name: 'ExtendBaseEntity',
+  abstract: true,
+  extends: BaseEntitySchema,
   properties: {
-    id: p.integer().primary().autoincrement(),
-    title: p.string(),
-    categoryId: () =>
-      p.manyToOne(Category).ref().fieldName('categoryId').nullable(),
+    createTime: p.bigint('number').defaultRaw('(unixepoch() * 1000)').fieldName('createTime'),
+    createUserId: () =>
+      p.manyToOne(userEntityRef).nullable().fieldName('createUserId').ref().deleteRule('set null').updateRule('cascade'),
+    updateTime: p
+      .bigint('number')
+      .nullable()
+      .onUpdate((): number => Date.now())
+      .fieldName('updateTime'),
+    updateUserId: () =>
+      p
+        .manyToOne(userEntityRef)
+        .nullable()
+        .fieldName('updateUserId')
+        .ref()
+        .deleteRule('set null')
+        .updateRule('cascade'),
   },
 });
+class ExtendBaseEntity extends ExtendBaseEntitySchema.class {}
+ExtendBaseEntitySchema.setClass(ExtendBaseEntity);
 
-class Item extends ItemSchema.class {}
-ItemSchema.setClass(Item);
+// --- RuleGroup ---
+const RuleGroupSchema = defineEntity({
+  name: 'RuleGroupEntity',
+  tableName: 'rule_groups',
+  extends: ExtendBaseEntitySchema,
+  properties: {
+    name: p.string().unique().fieldName('name'),
+    isFrontAccess: p.boolean().default(false).fieldName('isFrontAccess'),
+    isPortalAccess: p.boolean().default(false).fieldName('isPortalAccess'),
+  },
+});
+class RuleGroup extends RuleGroupSchema.class {}
+RuleGroupSchema.setClass(RuleGroup);
+
+// --- UserEntity ---
+const UserEntitySchema = defineEntity({
+  name: 'UserEntity',
+  tableName: 'users',
+  extends: ExtendBaseEntitySchema,
+  properties: {
+    login: p.string().length(255),
+    ruleGroupId: () =>
+      p
+        .manyToOne(RuleGroup)
+        .ref()
+        .fieldName('ruleGroupId')
+        .nullable()
+        .deleteRule('set null')
+        .updateRule('cascade'),
+  },
+});
+class UserEntity extends UserEntitySchema.class {}
+UserEntitySchema.setClass(UserEntity);
 
 let orm: MikroORM;
 
@@ -36,9 +85,10 @@ beforeAll(async () => {
   orm = await MikroORM.init({
     driver: SqliteDriver,
     dbName: ':memory:',
-    entities: [Category, Item],
+    entities: [RuleGroup, UserEntity],
     debug: ['query', 'query-params'],
     allowGlobalContext: true,
+    disableIdentityMap: true,
   });
   await orm.schema.refresh();
 });
@@ -47,20 +97,30 @@ afterAll(async () => {
   await orm.close(true);
 });
 
-test('dirty tracking detects changes to manyToOne Ref fields defined via defineEntity', async () => {
-  // Setup: item with no category
-  const category = orm.em.create(Category, { name: 'electronics' });
-  orm.em.create(Item, { title: 'phone', categoryId: null });
+test('dirty tracking detects manyToOne Ref change with full entity hierarchy', async () => {
+  // Setup: system user + ruleGroup + admin user (ruleGroupId = null)
+  const systemUser = orm.em.create(UserEntity, { login: 'system', createUserId: null, ruleGroupId: null });
+  const ruleGroup = orm.em.create(RuleGroup, { name: 'admin', createUserId: ref(systemUser) });
+  orm.em.create(UserEntity, { login: 'admin', createUserId: ref(systemUser), ruleGroupId: null });
   await orm.em.flush();
+
+  // Simulate seeder: nativeUpdate on RuleGroup BEFORE assigning Ref on User
+  // (in the real seeder, nativeUpdate is called when ruleGroup already exists in DB)
+  await orm.em.nativeUpdate(
+    RuleGroup,
+    { id: ruleGroup.id },
+    { isFrontAccess: true, isPortalAccess: true, updateUserId: systemUser.id, updateTime: Date.now() },
+  );
+
+  // Act: load admin user and assign ruleGroupId (all entities still managed in same EM)
+  const adminUser = await orm.em.findOneOrFail(UserEntity, { login: 'admin' });
+  adminUser.ruleGroupId = ref(ruleGroup);
+  adminUser.updateUserId = ref(systemUser);
+  await orm.em.flush(); // should generate UPDATE
   orm.em.clear();
 
-  // Act: assign category to item via Ref field
-  const item = await orm.em.findOneOrFail(Item, { title: 'phone' });
-  item.categoryId = ref(category); // change from null → Ref
-  await orm.em.flush(); // expected: UPDATE items SET categoryId = 1 WHERE id = 1
-  orm.em.clear();
-
-  // Assert: change must be persisted
-  const reloaded = await orm.em.findOneOrFail(Item, { title: 'phone' });
-  expect(reloaded.categoryId).not.toBeNull();
+  // Assert
+  const reloaded = await orm.em.findOneOrFail(UserEntity, { login: 'admin' });
+  expect(reloaded.ruleGroupId).not.toBeNull();
+  expect(reloaded.updateUserId).not.toBeNull();
 });
