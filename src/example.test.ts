@@ -40,7 +40,7 @@ beforeAll(async () => {
     debug: ['query', 'query-params'],
     allowGlobalContext: true,
   });
-  await orm.schema.refreshDatabase();
+  await orm.schema.refresh();
 });
 
 afterAll(async () => {
