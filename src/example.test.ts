@@ -1,54 +1,66 @@
-import 'reflect-metadata';
-import { Entity, PrimaryKey, Property, ReflectMetadataProvider } from '@mikro-orm/decorators/legacy';
-import { MikroORM } from '@mikro-orm/sqlite';
+import { defineEntity, MikroORM, p, ref } from '@mikro-orm/core';
+import { SqliteDriver } from '@mikro-orm/sqlite';
 
-@Entity()
-class User {
+// Issue: https://github.com/mikro-orm/mikro-orm/issues/7843
+// defineEntity API: dirty tracking doesn't detect changes to manyToOne Ref fields
 
-  @PrimaryKey()
-  id!: number;
+const CategorySchema = defineEntity({
+  name: 'Category',
+  tableName: 'categories',
+  properties: {
+    id: p.integer().primary().autoincrement(),
+    name: p.string(),
+  },
+});
 
-  @Property()
-  name: string;
+class Category extends CategorySchema.class {}
+CategorySchema.setClass(Category);
 
-  @Property({ unique: true })
-  email: string;
+const ItemSchema = defineEntity({
+  name: 'Item',
+  tableName: 'items',
+  properties: {
+    id: p.integer().primary().autoincrement(),
+    title: p.string(),
+    categoryId: () =>
+      p.manyToOne(Category).ref().fieldName('categoryId').nullable(),
+  },
+});
 
-  constructor(name: string, email: string) {
-    this.name = name;
-    this.email = email;
-  }
-
-}
+class Item extends ItemSchema.class {}
+ItemSchema.setClass(Item);
 
 let orm: MikroORM;
 
 beforeAll(async () => {
   orm = await MikroORM.init({
+    driver: SqliteDriver,
     dbName: ':memory:',
-    entities: [User],
-    metadataProvider: ReflectMetadataProvider,
+    entities: [Category, Item],
     debug: ['query', 'query-params'],
-    allowGlobalContext: true, // only for testing
+    allowGlobalContext: true,
   });
-  await orm.schema.refresh();
+  await orm.schema.refreshDatabase();
 });
 
 afterAll(async () => {
   await orm.close(true);
 });
 
-test('basic CRUD example', async () => {
-  orm.em.create(User, { name: 'Foo', email: 'foo' });
+test('dirty tracking detects changes to manyToOne Ref fields defined via defineEntity', async () => {
+  // Setup: item with no category
+  const category = orm.em.create(Category, { name: 'electronics' });
+  orm.em.create(Item, { title: 'phone', categoryId: null });
   await orm.em.flush();
   orm.em.clear();
 
-  const user = await orm.em.findOneOrFail(User, { email: 'foo' });
-  expect(user.name).toBe('Foo');
-  user.name = 'Bar';
-  orm.em.remove(user);
-  await orm.em.flush();
+  // Act: assign category to item via Ref field
+  const item = await orm.em.findOneOrFail(Item, { title: 'phone' });
+  item.categoryId = ref(category); // change from null → Ref
+  await orm.em.flush(); // expected: UPDATE items SET categoryId = 1 WHERE id = 1
+  orm.em.clear();
 
-  const count = await orm.em.count(User, { email: 'foo' });
-  expect(count).toBe(0);
+  // Assert: change must be persisted
+  const reloaded = await orm.em.findOneOrFail(Item, { title: 'phone' });
+  expect(reloaded.categoryId).not.toBeNull();
 });
